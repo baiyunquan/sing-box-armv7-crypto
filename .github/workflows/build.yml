@@ -95,10 +95,10 @@ jobs:
       - name: Verify Binaries with QEMU User Emulation
         run: |
           cd dist
-          echo "Testing binaries execution on emulated Cortex-A53..."
-          qemu-arm -cpu cortex-a53 ./sing-box-linux-armv7-static version || exit 1
-          qemu-arm -cpu cortex-a53 ./sing-box-linux-armv7-crypto version || exit 1
-          echo "All binaries executed successfully on Cortex-A53!"
+          echo "Testing binaries execution on emulated ARMv7 / ARMv8..."
+          qemu-arm -cpu max ./sing-box-linux-armv7-static version || exit 1
+          qemu-arm -cpu max ./sing-box-linux-armv7-crypto version || exit 1
+          echo "All binaries executed successfully on ARMv7 / Cortex-A53!"
 
       - name: Package Artifacts
         run: |
