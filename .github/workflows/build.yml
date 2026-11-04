@@ -43,10 +43,11 @@ jobs:
 
       - name: Install Zig for Musl Cross Compilation
         run: |
-          pip install ziglang
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-          export PATH="$HOME/.local/bin:$PATH"
+          sudo mkdir -p /usr/local/zig
+          curl -sL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | sudo tar -xJ -C /usr/local/zig --strip-components=1
+          sudo ln -s /usr/local/zig/zig /usr/local/bin/zig
           zig version
+
 
 
 
