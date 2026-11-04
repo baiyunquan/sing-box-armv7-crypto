@@ -44,7 +44,10 @@ jobs:
       - name: Install Zig for Musl Cross Compilation
         run: |
           pip install ziglang
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.local/bin:$PATH"
           zig version
+
 
 
       - name: Clone sing-box Source
