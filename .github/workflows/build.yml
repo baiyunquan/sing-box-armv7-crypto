@@ -42,9 +42,10 @@ jobs:
           sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf qemu-user-static binutils-arm-linux-gnueabihf
 
       - name: Install Zig for Musl Cross Compilation
-        uses: mlugg/setup-zig@v1
-        with:
-          zig-version: 0.13.0
+        run: |
+          pip install ziglang
+          zig version
+
 
       - name: Clone sing-box Source
         run: |
