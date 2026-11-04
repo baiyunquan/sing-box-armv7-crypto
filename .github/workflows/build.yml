@@ -1,0 +1,127 @@
+name: Build sing-box with ARMv8 Hardware Crypto for ARMv7
+
+on:
+  workflow_dispatch:
+    inputs:
+      sing_version:
+        description: "sing-box version or git tag (e.g. v1.13.21, v1.14.4)"
+        required: true
+        default: "v1.13.21"
+      build_tags:
+        description: "sing-box build tags"
+        required: true
+        default: "with_quic,with_dhcp,with_wireguard,with_shadowsocks,with_vless,with_trojan,with_clash_api,with_utls"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/**"
+      - "README.md"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build sing-box ARMv7 (Hardware Crypto Accelerated)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Builder Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.24
+          cache: false
+
+      - name: Install Cross Toolchains & QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf qemu-user-static binutils-arm-linux-gnueabihf
+
+      - name: Install Zig for Musl Cross Compilation
+        uses: mlugg/setup-zig@v1
+        with:
+          zig-version: 0.13.0
+
+      - name: Clone sing-box Source
+        run: |
+          TARGET_VER="${{ github.event.inputs.sing_version || 'v1.13.21' }}"
+          echo "Cloning sing-box at tag/branch: ${TARGET_VER}"
+          git clone --depth 1 -b "${TARGET_VER}" https://github.com/SagerNet/sing-box.git sing-box-src
+          cd sing-box-src
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          echo "COMMIT_HASH=${COMMIT_HASH}" >> $GITHUB_ENV
+          echo "ACTUAL_VERSION=${TARGET_VER}" >> $GITHUB_ENV
+
+      - name: Build Variant 1 - Standalone Musl Static (ARMv7 + VFPv4, Compatible with OpenWrt Musl)
+        run: |
+          cd sing-box-src
+          TAGS="${{ github.event.inputs.build_tags || 'with_quic,with_dhcp,with_wireguard,with_shadowsocks,with_vless,with_trojan,with_clash_api,with_utls' }}"
+          mkdir -p ../dist
+
+          echo "Building Variant 1 (Pure Static GOARM=7)..."
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 \
+          go build -v -trimpath \
+            -tags "${TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ env.ACTUAL_VERSION }}' -s -w -buildid=" \
+            -o ../dist/sing-box-linux-armv7-static ./cmd/sing-box
+
+      - name: Build Variant 2 - Hardware Crypto Accelerated (Zig Musl + ARMv8 Crypto Flag)
+        run: |
+          cd sing-box-src
+          TAGS="${{ github.event.inputs.build_tags || 'with_quic,with_dhcp,with_wireguard,with_shadowsocks,with_vless,with_trojan,with_clash_api,with_utls' }}"
+          
+          echo "Building Variant 2 (CGO + Zig Musl Static with -march=armv8-a+crypto)..."
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 \
+          CC="zig cc -target arm-linux-musleabi -march=armv8-a+crypto -mfpu=crypto-neon-fp-armv8" \
+          CXX="zig c++ -target arm-linux-musleabi -march=armv8-a+crypto -mfpu=crypto-neon-fp-armv8" \
+          CGO_CFLAGS="-march=armv8-a+crypto -O3" \
+          CGO_LDFLAGS="-static" \
+          go build -v -trimpath \
+            -tags "${TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ env.ACTUAL_VERSION }}' -s -w -buildid=" \
+            -o ../dist/sing-box-linux-armv7-crypto ./cmd/sing-box
+
+      - name: Verify Binaries with QEMU User Emulation
+        run: |
+          cd dist
+          echo "Testing binaries execution on emulated Cortex-A53..."
+          qemu-arm -cpu cortex-a53 ./sing-box-linux-armv7-static version || exit 1
+          qemu-arm -cpu cortex-a53 ./sing-box-linux-armv7-crypto version || exit 1
+          echo "All binaries executed successfully on Cortex-A53!"
+
+      - name: Package Artifacts
+        run: |
+          cd dist
+          tar -czvf sing-box-linux-armv7-static.tar.gz sing-box-linux-armv7-static
+          tar -czvf sing-box-linux-armv7-crypto.tar.gz sing-box-linux-armv7-crypto
+          sha256sum sing-box-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-armv7-builds
+          path: dist/*
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        with:
+          tag_name: ${{ env.ACTUAL_VERSION }}-armv7-crypto
+          name: sing-box ${{ env.ACTUAL_VERSION }} (ARMv7 IPQ60xx Hardware Accelerated)
+          body: |
+            ## Sing-box for 32-bit ARM (IPQ60xx / Cortex-A53 / ARMv7)
+
+            - **Target**: Qualcomm IPQ6018 / IPQ6000 / IPQ807x / Cortex-A53 running 32-bit OpenWrt / QSDK.
+            - **sing-box-linux-armv7-crypto**: Compiled with CGO and Zig Musl static targeting `-march=armv8-a+crypto`.
+            - **sing-box-linux-armv7-static**: Pure static Go build with `GOARM=7` VFP hardware floating point.
+            - Compatible with ShellCrash (`/etc/ShellCrash/CrashCore`).
+          draft: false
+          prerelease: false
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS.txt
