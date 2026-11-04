@@ -39,13 +39,14 @@ jobs:
       - name: Install Cross Toolchains & QEMU
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf qemu-user-static binutils-arm-linux-gnueabihf
+          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf qemu-user qemu-user-static binutils-arm-linux-gnueabihf
+          which qemu-arm || sudo ln -sf $(which qemu-arm-static) /usr/local/bin/qemu-arm
 
       - name: Install Zig for Musl Cross Compilation
         run: |
           sudo mkdir -p /usr/local/zig
           curl -sL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | sudo tar -xJ -C /usr/local/zig --strip-components=1
-          sudo ln -s /usr/local/zig/zig /usr/local/bin/zig
+          sudo ln -sf /usr/local/zig/zig /usr/local/bin/zig
           zig version
 
 
@@ -79,16 +80,17 @@ jobs:
           cd sing-box-src
           TAGS="${{ github.event.inputs.build_tags || 'with_quic,with_dhcp,with_wireguard,with_shadowsocks,with_vless,with_trojan,with_clash_api,with_utls' }}"
           
-          echo "Building Variant 2 (CGO + Zig Musl Static with -march=armv8-a+crypto)..."
+          echo "Building Variant 2 (CGO + Zig Musl Static with cortex_a53)..."
           CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 \
-          CC="zig cc -target arm-linux-musleabi -march=armv8-a+crypto -mfpu=crypto-neon-fp-armv8" \
-          CXX="zig c++ -target arm-linux-musleabi -march=armv8-a+crypto -mfpu=crypto-neon-fp-armv8" \
-          CGO_CFLAGS="-march=armv8-a+crypto -O3" \
+          CC="zig cc -target arm-linux-musleabi -mcpu=cortex_a53" \
+          CXX="zig c++ -target arm-linux-musleabi -mcpu=cortex_a53" \
+          CGO_CFLAGS="-O3" \
           CGO_LDFLAGS="-static" \
           go build -v -trimpath \
             -tags "${TAGS}" \
             -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ env.ACTUAL_VERSION }}' -s -w -buildid=" \
             -o ../dist/sing-box-linux-armv7-crypto ./cmd/sing-box
+
 
       - name: Verify Binaries with QEMU User Emulation
         run: |
@@ -114,7 +116,7 @@ jobs:
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
         with:
           tag_name: ${{ env.ACTUAL_VERSION }}-armv7-crypto
           name: sing-box ${{ env.ACTUAL_VERSION }} (ARMv7 IPQ60xx Hardware Accelerated)
