@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       sing_version:
-        description: "sing-box version or git tag (e.g. v1.11.8, v1.12.0, v1.13.21)"
+        description: "sing-box version or git tag (e.g. v1.14.4, v1.13.21, v1.11.8)"
         required: true
-        default: "v1.11.8"
+        default: "v1.14.4"
       build_tags:
         description: "sing-box build tags"
         required: true
@@ -38,8 +38,11 @@ jobs:
 
       - name: Install Toolchains, CMake, Ninja & QEMU
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf cmake ninja-build perl qemu-user qemu-user-static binutils-arm-linux-gnueabihf llvm
+          sudo killall apt apt-get unattended-upgrades dpkg 2>/dev/null || true
+          sudo rm -f /var/lib/dpkg/lock* /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || true
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::Retries=3
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf cmake ninja-build perl qemu-user-static binutils-arm-linux-gnueabihf
           which qemu-arm || sudo ln -sf $(which qemu-arm-static) /usr/local/bin/qemu-arm
 
       - name: Build 32-bit ARM BoringSSL Static Library
@@ -107,7 +110,7 @@ jobs:
 
       - name: Clone sing-box Source
         run: |
-          TARGET_VER="${{ github.event.inputs.sing_version || 'v1.11.8' }}"
+          TARGET_VER="${{ github.event.inputs.sing_version || 'v1.14.4' }}"
           echo "Cloning sing-box at tag: ${TARGET_VER}"
           git clone --depth 1 -b "${TARGET_VER}" https://github.com/SagerNet/sing-box.git sing-box-src
           cd sing-box-src
@@ -128,13 +131,13 @@ jobs:
             -tags "${TAGS}" \
             -ldflags "-linkmode=external -extldflags '-static -pthread -lstdc++' -X 'github.com/sagernet/sing-box/constant.Version=${{ env.ACTUAL_VERSION }}-hwcrypto' -s -w -buildid=" \
             -o ../dist/sing-box-linux-armv7-boringcrypto ./cmd/sing-box
-          llvm-strip -s ../dist/sing-box-linux-armv7-boringcrypto
+          arm-linux-gnueabihf-strip -s ../dist/sing-box-linux-armv7-boringcrypto
 
       - name: Disassemble & Assert Hardware Crypto Instructions (aese/aesd/pmull)
         run: |
           cd dist
           echo "Scanning binary for ARMv8 Crypto instructions..."
-          llvm-objdump -d ./sing-box-linux-armv7-boringcrypto > /tmp/disasm.txt
+          arm-linux-gnueabihf-objdump -d ./sing-box-linux-armv7-boringcrypto > /tmp/disasm.txt
           CRYPTO_OPS=$(grep -E "f3b0[0-9a-f]{2}0[0-9a-f]|f3b0[0-9a-f]{2}84|aese|aesd|pmull" /tmp/disasm.txt | wc -l)
           echo "=========================================================="
           echo "ARMv8 Hardware Crypto Instructions count: ${CRYPTO_OPS}"
