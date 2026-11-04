@@ -67,7 +67,8 @@ jobs:
       - name: Generate and Install goboringcrypto_linux_arm.syso into Go SDK
         run: |
           GOROOT=$(go env GOROOT)
-          LIB_CRYPTO="$(pwd)/boringssl-src/build/crypto/libcrypto.a"
+          LIB_CRYPTO="$(find $(pwd)/boringssl-src/build -name libcrypto.a | head -n 1)"
+          echo "Found libcrypto.a at: ${LIB_CRYPTO}"
           WORKDIR="$(pwd)/boring-syso"
           mkdir -p "${WORKDIR}" && cd "${WORKDIR}"
           
