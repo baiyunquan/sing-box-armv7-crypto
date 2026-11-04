@@ -88,7 +88,7 @@ jobs:
           CGO_LDFLAGS="-static" \
           go build -v -trimpath \
             -tags "${TAGS}" \
-            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ env.ACTUAL_VERSION }}' -s -w -buildid=" \
+            -ldflags "-linkmode=external -extldflags '-static' -X 'github.com/sagernet/sing-box/constant.Version=${{ env.ACTUAL_VERSION }}' -s -w -buildid=" \
             -o ../dist/sing-box-linux-armv7-crypto ./cmd/sing-box
 
 
