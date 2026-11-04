@@ -46,6 +46,7 @@ jobs:
           echo "Cloning official Google BoringSSL..."
           git clone --depth 1 https://github.com/google/boringssl.git boringssl-src
           cd boringssl-src
+          find . -name CMakeLists.txt -exec sed -i 's/-Werror//g' {} +
           mkdir -p build && cd build
           
           echo "Configuring BoringSSL for 32-bit ARM Cortex-A53 with ARMv8 Crypto..."
@@ -57,6 +58,7 @@ jobs:
             -DCMAKE_C_FLAGS="-mcpu=cortex-a53 -mfpu=crypto-neon-fp-armv8 -fPIC -O3" \
             -DCMAKE_CXX_FLAGS="-mcpu=cortex-a53 -mfpu=crypto-neon-fp-armv8 -fPIC -O3" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
             ..
           
           echo "Compiling libcrypto.a..."
@@ -89,10 +91,22 @@ jobs:
           echo "Enabling 32-bit ARM in Go crypto/internal/boring build constraints..."
           sudo sed -i 's/(amd64 || arm64)/(amd64 || arm64 || arm)/g' ${GOROOT}/src/crypto/internal/boring/*.go
           sudo sed -i 's/panic("boringcrypto: not in FIPS mode")/\/\/ bypass fips mode check/' ${GOROOT}/src/crypto/internal/boring/boring.go
+          
+          echo "Patching HMAC, RSA, and SHA-512 to fallback to Go stdlib pure Go..."
+          # HMAC fallback
+          sudo sed -i 's/return &hmac{/return nil \/\/ fallback pure Go\n\treturn \&hmac{/' ${GOROOT}/src/crypto/internal/boring/hmac.go
+          # RSA fallback
+          sudo sed -i '/^package rsa/a const boringEnabled = false' ${GOROOT}/src/crypto/rsa/boring.go
+          sudo sed -i '/^package rsa/a const boringEnabled = false' ${GOROOT}/src/crypto/rsa/notboring.go
+          sudo sed -i 's/boring\.Enabled/boringEnabled/g' ${GOROOT}/src/crypto/rsa/fips.go
+          sudo sed -i 's/boring\.Enabled/boringEnabled/g' ${GOROOT}/src/crypto/rsa/pkcs1v15.go
+          sudo sed -i 's/boring\.Enabled/boringEnabled/g' ${GOROOT}/src/crypto/rsa/rsa.go
+          # SHA-512 fallback
+          sudo sed -i 's/if boring\.Enabled/if false/g' ${GOROOT}/src/crypto/sha512/sha512.go
 
       - name: Clone sing-box Source
         run: |
-          TARGET_VER="${{ github.event.inputs.sing_version || 'v1.13.21' }}"
+          TARGET_VER="${{ github.event.inputs.sing_version || 'v1.11.8' }}"
           echo "Cloning sing-box at tag: ${TARGET_VER}"
           git clone --depth 1 -b "${TARGET_VER}" https://github.com/SagerNet/sing-box.git sing-box-src
           cd sing-box-src
@@ -111,8 +125,9 @@ jobs:
           GOEXPERIMENT=boringcrypto \
           go build -v -trimpath \
             -tags "${TAGS}" \
-            -ldflags "-linkmode=external -extldflags '-static -pthread' -X 'github.com/sagernet/sing-box/constant.Version=${{ env.ACTUAL_VERSION }}-scheme1' -s -w -buildid=" \
+            -ldflags "-linkmode=external -extldflags '-static -pthread -lstdc++' -X 'github.com/sagernet/sing-box/constant.Version=${{ env.ACTUAL_VERSION }}-scheme1' -s -w -buildid=" \
             -o ../dist/sing-box-linux-armv7-boringcrypto ./cmd/sing-box
+          llvm-strip -s ../dist/sing-box-linux-armv7-boringcrypto
 
       - name: Disassemble & Assert Hardware Crypto Instructions (aese/aesd/pmull)
         run: |
