@@ -100,11 +100,9 @@ jobs:
           # HMAC fallback
           sudo sed -i 's/return &hmac{/return nil \/\/ fallback pure Go\n\treturn \&hmac{/' ${GOROOT}/src/crypto/internal/boring/hmac.go
           # RSA fallback
-          sudo sed -i '/^package rsa/a const boringEnabled = false' ${GOROOT}/src/crypto/rsa/boring.go
-          sudo sed -i '/^package rsa/a const boringEnabled = false' ${GOROOT}/src/crypto/rsa/notboring.go
-          sudo sed -i 's/boring\.Enabled/boringEnabled/g' ${GOROOT}/src/crypto/rsa/fips.go
-          sudo sed -i 's/boring\.Enabled/boringEnabled/g' ${GOROOT}/src/crypto/rsa/pkcs1v15.go
-          sudo sed -i 's/boring\.Enabled/boringEnabled/g' ${GOROOT}/src/crypto/rsa/rsa.go
+          sudo sed -i 's/boring\.Enabled/false/g' ${GOROOT}/src/crypto/rsa/fips.go
+          sudo sed -i 's/boring\.Enabled/false/g' ${GOROOT}/src/crypto/rsa/pkcs1v15.go
+          sudo sed -i 's/boring\.Enabled/false/g' ${GOROOT}/src/crypto/rsa/rsa.go
           # SHA-512 fallback
           sudo sed -i 's/if boring\.Enabled/if false/g' ${GOROOT}/src/crypto/sha512/sha512.go
 
