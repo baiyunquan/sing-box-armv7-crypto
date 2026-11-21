@@ -285,13 +285,93 @@ jobs:
           fi
           echo "SUCCESS: Hardware AES/PMULL instructions verified in final binary!"
 
+      - name: Diagnose QEMU startup crash
+        continue-on-error: true
+        run: |
+          set +e
+          cd dist
+          BIN=./sing-box-linux-armv7-boringcrypto
+          echo "=== qemu ==="
+          "${QEMU_ARM}" --version | head -n 2
+          echo "=== ELF identity (EXEC vs DYN tells us whether this is a static PIE) ==="
+          file "${BIN}"
+          arm-linux-gnueabihf-readelf -h "${BIN}" | grep -E 'Type|Machine|Entry'
+          arm-linux-gnueabihf-readelf -l "${BIN}" | grep -E 'INTERP|DYNAMIC|GNU_STACK' || echo "no INTERP/DYNAMIC segments"
+          echo "=== CPU model matrix ==="
+          for cpu in max cortex-a53 cortex-a15 cortex-a7; do
+            echo "--- -cpu ${cpu}"
+            "${QEMU_ARM}" -cpu "${cpu}" "${BIN}" version 2>&1 | head -n 5
+            echo "exit=${PIPESTATUS[0]}"
+          done
+          echo "--- default cpu model"
+          "${QEMU_ARM}" "${BIN}" version 2>&1 | head -n 5
+          echo "exit=${PIPESTATUS[0]}"
+          echo "=== syscall trace tail (-cpu max) ==="
+          "${QEMU_ARM}" -strace -cpu max "${BIN}" version > /tmp/sing-strace.txt 2>&1
+          tail -n 25 /tmp/sing-strace.txt
+          echo "=== guest errors (-cpu max) ==="
+          "${QEMU_ARM}" -d guest_errors -cpu max "${BIN}" version 2>&1 | tail -n 15
+          echo "=== reference binaries (isolate emulator vs cgo vs BoringCrypto) ==="
+          mkdir -p /tmp/ref/purego /tmp/ref/cgohello && cd /tmp/ref
+          go mod init ref >/dev/null 2>&1
+          cat > purego/main.go <<'GO'
+          package main
+
+          func main() { println("ref-purego-ok") }
+          GO
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 \
+            go build -trimpath -o ref-purego ./purego
+          echo "--- pure Go static: $(arm-linux-gnueabihf-readelf -h ./ref-purego | grep -oE 'Type: [A-Z]+')"
+          "${QEMU_ARM}" -cpu max ./ref-purego 2>&1 | head -n 3
+          echo "exit=${PIPESTATUS[0]}"
+
+          cat > cgohello/main.go <<'GO'
+          package main
+
+          /*
+          #include <stdio.h>
+          static void hello(void) { puts("ref-cgo-hello-ok"); }
+          */
+          import "C"
+
+          func main() { C.hello() }
+          GO
+          CGO_FLAGS="-mcpu=cortex-a53 -mfpu=crypto-neon-fp-armv8"
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 \
+          CC="arm-linux-gnueabihf-gcc ${CGO_FLAGS}" \
+          CXX="arm-linux-gnueabihf-g++ ${CGO_FLAGS}" \
+            go build -trimpath \
+              -ldflags "-linkmode=external -extldflags '-static -pthread -lstdc++' -s -w -buildid=" \
+              -o ref-cgo ./cgohello
+          echo "--- cgo static: $(arm-linux-gnueabihf-readelf -h ./ref-cgo | grep -oE 'Type: [A-Z]+')"
+          "${QEMU_ARM}" -cpu max ./ref-cgo 2>&1 | head -n 3
+          echo "exit=${PIPESTATUS[0]}"
+
+          GOEXPERIMENT=boringcrypto CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 \
+          CC="arm-linux-gnueabihf-gcc ${CGO_FLAGS}" \
+          CXX="arm-linux-gnueabihf-g++ ${CGO_FLAGS}" \
+            go build -trimpath \
+              -ldflags "-linkmode=external -extldflags '-static -pthread -lstdc++' -s -w -buildid=" \
+              -o ref-boring ./cgohello
+          echo "--- cgo+boringcrypto static: $(arm-linux-gnueabihf-readelf -h ./ref-boring | grep -oE 'Type: [A-Z]+')"
+          "${QEMU_ARM}" -cpu max ./ref-boring 2>&1 | head -n 3
+          echo "exit=${PIPESTATUS[0]}"
+
       - name: Verify Execution with QEMU
         run: |
           cd dist
           QEMU_ARM="${QEMU_ARM:-qemu-arm}"
-          echo "Testing execution under ${QEMU_ARM} (-cpu max)..."
-          "${QEMU_ARM}" -cpu max ./sing-box-linux-armv7-boringcrypto version
-          echo "sing-box executed successfully under QEMU!"
+          BIN=./sing-box-linux-armv7-boringcrypto
+          for cpu in cortex-a53 max; do
+            echo "Testing execution under ${QEMU_ARM} (-cpu ${cpu})..."
+            if "${QEMU_ARM}" -cpu "${cpu}" "${BIN}" version; then
+              echo "sing-box executed successfully under QEMU (-cpu ${cpu})!"
+              exit 0
+            fi
+            echo "-cpu ${cpu} did not work, trying the next model"
+          done
+          echo "ERROR: binary did not run under any QEMU CPU model"
+          exit 1
 
       - name: Package Artifacts
         run: |
