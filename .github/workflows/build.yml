@@ -122,18 +122,16 @@ jobs:
           # crypto/internal/boring/goboringcrypto.h embeds the C structs by value with
           # hard-coded sizes taken from the FIPS BoringCrypto snapshot Go's official syso
           # is built against (char data[104] for HMAC_CTX, char data[600] for
-          # EVP_AEAD_CTX, ...). Building current BoringSSL master makes those structs
-          # larger than the Go wrappers, so HMAC_CTX/EVP_AEAD_CTX initialisation writes
-          # past the Go object and the heap dies later, e.g. with
-          # "fatal error: runtime.SetFinalizer: finalizer already set" in a live run.
-          # Use exactly the snapshot Go 1.25.5 pins (crypto/internal/boring/Dockerfile).
-          BORINGSSL_REV=0c6f40132b828e92ba365c6b7680e32820c63fa7
-          echo "Downloading BoringCrypto ${BORINGSSL_REV} (the snapshot Go 1.25.5 pins)..."
-          curl -fsSL --retry 3 -o /tmp/boringssl.tar.xz \
-            "https://commondatastorage.googleapis.com/chromium-boringssl-fips/boringssl-${BORINGSSL_REV}.tar.xz"
-          rm -rf boringssl boringssl-src
-          tar -xJf /tmp/boringssl.tar.xz
-          mv "$(ls -d boringssl* | head -n 1)" boringssl-src
+          # EVP_AEAD_CTX, char data[244] for AES_KEY, ...). Building current BoringSSL
+          # master makes those structs larger than the Go wrappers, so HMAC_CTX and
+          # EVP_AEAD_CTX initialisation writes past the Go object and corrupts the Go
+          # heap, e.g. "fatal error: runtime.SetFinalizer: finalizer already set" in a
+          # live run. Go 1.25.5 pins the FIPS snapshot fips-20220613
+          # (crypto/internal/boring/Dockerfile); its public tag has the same layout.
+          echo "Cloning BoringCrypto at tag fips-20220613 (the snapshot Go 1.25.5 pins)..."
+          rm -rf boringssl-src
+          git clone --depth 1 --branch fips-20220613 \
+            https://github.com/google/boringssl.git boringssl-src
           cd boringssl-src
 
           # Same source tweaks Go's own syso build applies (build-boring.sh): no weak
