@@ -124,6 +124,29 @@ jobs:
           echo "=== config check ==="
           qemu-arm -cpu max "${BIN}" check -c config.json
 
+          echo "=== smoke run without tracing (does a live run work under qemu at all?) ==="
+          qemu-arm -cpu max "${BIN}" run -c config.json > /tmp/smoke.log 2>&1 &
+          SMOKE_PID=$!
+          SMOKE_READY=no
+          for _ in $(seq 1 45); do
+            if curl -s -m 3 --socks5 127.0.0.1:11080 http://127.0.0.1:18388/ -o /dev/null; then
+              SMOKE_READY=yes
+              break
+            fi
+            kill -0 "${SMOKE_PID}" 2>/dev/null || break
+            sleep 2
+          done
+          echo "socks inbound ready: ${SMOKE_READY}; qemu alive: $(kill -0 "${SMOKE_PID}" 2>/dev/null && echo yes || echo no)"
+          kill -INT "${SMOKE_PID}" 2>/dev/null || true
+          for _ in $(seq 1 10); do
+            kill -0 "${SMOKE_PID}" 2>/dev/null || break
+            sleep 1
+          done
+          kill -KILL "${SMOKE_PID}" 2>/dev/null || true
+          wait "${SMOKE_PID}" 2>/dev/null || true
+          echo "--- smoke.log head ---"
+          head -n 40 /tmp/smoke.log || true
+
           echo "=== run with AES-128-GCM traffic while tracing executed code ==="
           qemu-arm -cpu max -d in_asm -D /tmp/traffic.log "${BIN}" run -c config.json > /tmp/sing.log 2>&1 &
           QEMU_PID=$!
@@ -146,8 +169,10 @@ jobs:
           wait "${QEMU_PID}" 2>/dev/null || true
           kill "${SINK_PID}" 2>/dev/null || true
 
+          echo "=== sing-box log head ==="
+          head -n 40 /tmp/sing.log || true
           echo "=== sing-box log tail ==="
-          tail -n 20 /tmp/sing.log || true
+          tail -n 12 /tmp/sing.log || true
 
           echo "=== trace size: $(stat -c %s /tmp/traffic.log 2>/dev/null || echo 0) bytes ==="
           for mnemonic in aese aesd aesmc pmull; do
