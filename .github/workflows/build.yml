@@ -33,8 +33,11 @@ jobs:
       - name: Setup Go Environment
         uses: actions/setup-go@v5
         with:
-          go-version: ^1.24
+          go-version: 1.25.5
           cache: false
+
+      - name: Report Go Version
+        run: go version
 
       - name: Install Toolchains, CMake, Ninja & QEMU
         run: |
@@ -100,13 +103,67 @@ jobs:
           # HMAC fallback
           sudo sed -i 's/return &hmac{/return nil \/\/ fallback pure Go\n\treturn \&hmac{/' ${GOROOT}/src/crypto/internal/boring/hmac.go
           # RSA fallback
-          sudo sed -i '/^package rsa/a const boringEnabled = false' ${GOROOT}/src/crypto/rsa/boring.go
-          sudo sed -i '/^package rsa/a const boringEnabled = false' ${GOROOT}/src/crypto/rsa/notboring.go
+          sudo python3 - "${GOROOT}/src/crypto/rsa" <<'PY'
+          from pathlib import Path
+          import sys
+
+          rsa_dir = Path(sys.argv[1])
+
+          def insert_after_imports(filename, grouped_import):
+              path = rsa_dir / filename
+              lines = path.read_text().splitlines()
+
+              if any("boringEnabled" in line for line in lines):
+                  raise SystemExit(f"{path} already contains boringEnabled")
+
+              imports = [index for index, line in enumerate(lines) if line.startswith("import ")]
+              if len(imports) != 1:
+                  raise SystemExit(f"expected one import declaration in {path}, found {len(imports)}")
+
+              import_start = imports[0]
+              declaration = lines[import_start].strip()
+              if grouped_import:
+                  if declaration != "import (":
+                      raise SystemExit(f"expected a grouped import in {path}, found {declaration!r}")
+                  import_end = next(
+                      (index for index in range(import_start + 1, len(lines)) if lines[index].strip() == ")"),
+                      None,
+                  )
+                  if import_end is None:
+                      raise SystemExit(f"unterminated import block in {path}")
+              else:
+                  if not declaration.startswith('import "') or not declaration.endswith('"'):
+                      raise SystemExit(f"expected one single-line import in {path}, found {declaration!r}")
+                  import_end = import_start
+
+              following = lines[import_end + 1:]
+              while following and not following[0].strip():
+                  following.pop(0)
+              updated = lines[:import_end + 1] + ["", "const boringEnabled = false", ""] + following
+              path.write_text("\n".join(updated) + "\n")
+
+          insert_after_imports("boring.go", grouped_import=True)
+          insert_after_imports("notboring.go", grouped_import=False)
+          PY
           sudo sed -i 's/boring\.Enabled/boringEnabled/g' ${GOROOT}/src/crypto/rsa/fips.go
           sudo sed -i 's/boring\.Enabled/boringEnabled/g' ${GOROOT}/src/crypto/rsa/pkcs1v15.go
           sudo sed -i 's/boring\.Enabled/boringEnabled/g' ${GOROOT}/src/crypto/rsa/rsa.go
           # SHA-512 fallback
           sudo sed -i 's/if boring\.Enabled/if false/g' ${GOROOT}/src/crypto/sha512/sha512.go
+
+          echo "Checking patched RSA files with gofmt..."
+          RSA_GOFMT_DIFF="${RUNNER_TEMP}/rsa-gofmt.diff"
+          if ! gofmt -d "${GOROOT}/src/crypto/rsa/boring.go" "${GOROOT}/src/crypto/rsa/notboring.go" > "${RSA_GOFMT_DIFF}"; then
+            cat "${RSA_GOFMT_DIFF}"
+            echo "ERROR: RSA fallback patch produced invalid Go syntax"
+            exit 1
+          fi
+          if [ -s "${RSA_GOFMT_DIFF}" ]; then
+            cat "${RSA_GOFMT_DIFF}"
+            echo "ERROR: patched RSA files are not gofmt-clean"
+            exit 1
+          fi
+          echo "RSA fallback patch parses and is gofmt-clean."
 
       - name: Clone sing-box Source
         run: |
