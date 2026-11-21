@@ -136,7 +136,45 @@ jobs:
           
           echo "Enabling 32-bit ARM in Go crypto/internal/boring build constraints..."
           sudo sed -i 's/(amd64 || arm64)/(amd64 || arm64 || arm)/g' ${GOROOT}/src/crypto/internal/boring/*.go
-          sudo sed -i 's/panic("boringcrypto: not in FIPS mode")/\/\/ bypass fips mode check/' ${GOROOT}/src/crypto/internal/boring/boring.go
+
+          # BoringSSL only defines BORINGSSL_bcm_power_on_self_test inside its FIPS build
+          # (crypto/fipsmodule/bcm.cc guards it with #if defined(BORINGSSL_FIPS) and marks
+          # it static), so a regular build exports no such symbol. Go's boring.go still
+          # calls it from init(), which breaks the external link with
+          # "undefined reference to `_goboringcrypto_BORINGSSL_bcm_power_on_self_test'".
+          # This is not a FIPS build, so drop the self-test call and bypass the FIPS-mode
+          # gate; there is no validated self-test to run against a locally built libcrypto.
+          sudo python3 - "${GOROOT}/src/crypto/internal/boring/boring.go" <<'PY'
+          from pathlib import Path
+          import sys
+
+          path = Path(sys.argv[1])
+          lines = path.read_text().splitlines(keepends=True)
+
+          self_test = "C._goboringcrypto_BORINGSSL_bcm_power_on_self_test()"
+          fips_panic = 'panic("boringcrypto: not in FIPS mode")'
+
+          kept = []
+          removed_self_test = 0
+          bypassed_fips = 0
+          for line in lines:
+              if self_test in line:
+                  removed_self_test += 1
+                  continue
+              if fips_panic in line:
+                  bypassed_fips += 1
+                  kept.append(line.replace(fips_panic, "// bypass fips mode check"))
+                  continue
+              kept.append(line)
+
+          if removed_self_test != 1:
+              raise SystemExit(f"{path}: expected one BoringSSL self-test call, found {removed_self_test}")
+          if bypassed_fips != 1:
+              raise SystemExit(f"{path}: expected one FIPS-mode panic, found {bypassed_fips}")
+
+          path.write_text("".join(kept))
+          print(f"{path}: dropped BoringSSL self-test call and bypassed the FIPS-mode check")
+          PY
           
           echo "Patching HMAC, RSA, and SHA-512 to fallback to Go stdlib pure Go..."
           # HMAC fallback
@@ -190,19 +228,22 @@ jobs:
           # SHA-512 fallback
           sudo sed -i 's/if boring\.Enabled/if false/g' ${GOROOT}/src/crypto/sha512/sha512.go
 
-          echo "Checking patched RSA files with gofmt..."
-          RSA_GOFMT_DIFF="${RUNNER_TEMP}/rsa-gofmt.diff"
-          if ! gofmt -d "${GOROOT}/src/crypto/rsa/boring.go" "${GOROOT}/src/crypto/rsa/notboring.go" > "${RSA_GOFMT_DIFF}"; then
-            cat "${RSA_GOFMT_DIFF}"
-            echo "ERROR: RSA fallback patch produced invalid Go syntax"
+          echo "Checking patched standard-library files with gofmt..."
+          STDLIB_GOFMT_DIFF="${RUNNER_TEMP}/stdlib-gofmt.diff"
+          if ! gofmt -d \
+            "${GOROOT}/src/crypto/internal/boring/boring.go" \
+            "${GOROOT}/src/crypto/rsa/boring.go" \
+            "${GOROOT}/src/crypto/rsa/notboring.go" > "${STDLIB_GOFMT_DIFF}"; then
+            cat "${STDLIB_GOFMT_DIFF}"
+            echo "ERROR: standard-library patch produced invalid Go syntax"
             exit 1
           fi
-          if [ -s "${RSA_GOFMT_DIFF}" ]; then
-            cat "${RSA_GOFMT_DIFF}"
-            echo "ERROR: patched RSA files are not gofmt-clean"
+          if [ -s "${STDLIB_GOFMT_DIFF}" ]; then
+            cat "${STDLIB_GOFMT_DIFF}"
+            echo "ERROR: patched standard-library files are not gofmt-clean"
             exit 1
           fi
-          echo "RSA fallback patch parses and is gofmt-clean."
+          echo "Standard-library patches parse and are gofmt-clean."
 
       - name: Clone sing-box Source
         run: |
