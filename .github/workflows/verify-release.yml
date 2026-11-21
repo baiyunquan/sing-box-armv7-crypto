@@ -1,0 +1,164 @@
+name: Verify released binary uses ARMv8 hardware AES
+
+# Downloads the published release artifact and proves at instruction level that the
+# AES-128-GCM path really runs on the ARMv8 crypto extensions instead of the portable
+# C fallback: qemu logs every basic block it translates, so any aese/aesmc/pmull line
+# in the trace of a live AES-GCM encryption is direct evidence the hardware
+# instructions executed.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/verify-release.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify ARMv7 release binary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install QEMU and ARM binutils
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            qemu-user binutils-arm-linux-gnueabihf python3 curl
+
+      - name: Download the release assets and verify the checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=v1.14.4-hwcrypto
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir dl --clobber
+          cd dl
+          ls -l
+          grep 'tar.gz$' SHA256SUMS.txt | sha256sum -c -
+          tar -xzf sing-box-linux-armv7-boringcrypto.tar.gz
+          ls -l
+
+      - name: Static checks (static ELF, crypto instructions present)
+        working-directory: dl
+        run: |
+          BIN=./sing-box-linux-armv7-boringcrypto
+          file "${BIN}"
+          arm-linux-gnueabihf-readelf -h "${BIN}" | grep -E 'Class|Type|Machine'
+          if arm-linux-gnueabihf-readelf -d "${BIN}" 2>/dev/null | grep -q NEEDED; then
+            echo "ERROR: binary is dynamically linked"
+            exit 1
+          fi
+          echo "dynamic segment: none (fully static)"
+
+          arm-linux-gnueabihf-objdump -d "${BIN}" > /tmp/disasm.txt
+          echo "=== ARMv8 crypto mnemonics in the image ==="
+          for mnemonic in aese aesd aesmc aesimc pmull sha256h; do
+            printf '%-8s %s\n' "${mnemonic}" "$(awk -v m="${mnemonic}" 'index($0, m ".") { n++ } END { print n+0 }' /tmp/disasm.txt)"
+          done
+
+      - name: Runtime checks (boringcrypto active, hardware AES executed)
+        working-directory: dl
+        run: |
+          set -u
+          BIN=./sing-box-linux-armv7-boringcrypto
+
+          echo "=== version under qemu ==="
+          qemu-arm -cpu max "${BIN}" version | tee /tmp/version.txt
+          grep -q 'X:boringcrypto' /tmp/version.txt || {
+            echo "ERROR: BoringCrypto is not enabled in this build"
+            exit 1
+          }
+
+          echo "=== control trace: version command performs no AES work ==="
+          qemu-arm -cpu max -d in_asm -D /tmp/control.log "${BIN}" version > /dev/null
+          CONTROL_AES=$(awk 'index($0, "aese") { n++ } END { print n+0 }' /tmp/control.log)
+          echo "aese instructions executed without AES traffic: ${CONTROL_AES}"
+
+          echo "=== starting a TCP sink the shadowsocks outbound can talk to ==="
+          cat > /tmp/sink.py <<'PY'
+          import socket
+          import threading
+
+          server = socket.socket()
+          server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          server.bind(("127.0.0.1", 18388))
+          server.listen(8)
+
+          def serve(conn):
+              try:
+                  conn.recv(8192)
+                  conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok")
+              except OSError:
+                  pass
+              finally:
+                  conn.close()
+
+          while True:
+              try:
+                  connection, _ = server.accept()
+              except OSError:
+                  break
+              threading.Thread(target=serve, args=(connection,), daemon=True).start()
+          PY
+          python3 /tmp/sink.py &
+          SINK_PID=$!
+
+          cat > config.json <<'JSON'
+          {
+            "log": { "level": "error" },
+            "inbounds": [
+              { "type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 11080 }
+            ],
+            "outbounds": [
+              {
+                "type": "shadowsocks",
+                "tag": "ss-out",
+                "server": "127.0.0.1",
+                "server_port": 18388,
+                "method": "aes-128-gcm",
+                "password": "verify-password"
+              }
+            ]
+          }
+          JSON
+          echo "=== config check ==="
+          qemu-arm -cpu max "${BIN}" check -c config.json
+
+          echo "=== run with AES-128-GCM traffic while tracing executed code ==="
+          qemu-arm -cpu max -d in_asm -D /tmp/traffic.log "${BIN}" run -c config.json > /tmp/sing.log 2>&1 &
+          QEMU_PID=$!
+          for _ in $(seq 1 60); do
+            if curl -s -m 3 --socks5 127.0.0.1:11080 http://127.0.0.1:18388/ -o /dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          curl -s -m 5 --socks5 127.0.0.1:11080 http://127.0.0.1:18388/ -o /dev/null || true
+          sleep 3
+
+          # SIGINT lets sing-box exit cleanly so qemu flushes its trace file.
+          kill -INT "${QEMU_PID}" 2>/dev/null || true
+          for _ in $(seq 1 15); do
+            kill -0 "${QEMU_PID}" 2>/dev/null || break
+            sleep 1
+          done
+          kill -KILL "${QEMU_PID}" 2>/dev/null || true
+          wait "${QEMU_PID}" 2>/dev/null || true
+          kill "${SINK_PID}" 2>/dev/null || true
+
+          echo "=== sing-box log tail ==="
+          tail -n 20 /tmp/sing.log || true
+
+          echo "=== trace size: $(stat -c %s /tmp/traffic.log 2>/dev/null || echo 0) bytes ==="
+          for mnemonic in aese aesd aesmc pmull; do
+            printf '%-8s %s\n' "${mnemonic}" "$(awk -v m="${mnemonic}" 'index($0, m) { n++ } END { print n+0 }' /tmp/traffic.log)"
+          done
+
+          AES_ROUNDS=$(awk 'index($0, "aese") { n++ } END { print n+0 }' /tmp/traffic.log)
+          if [ "${AES_ROUNDS}" -gt 0 ] && [ "${CONTROL_AES}" -eq 0 ]; then
+            echo "SUCCESS: ${AES_ROUNDS} AESE instructions executed during AES-128-GCM, none without traffic"
+            grep -m 5 'aese' /tmp/traffic.log
+          else
+            echo "ERROR: hardware AES was not executed (traffic=${AES_ROUNDS}, control=${CONTROL_AES})"
+            exit 1
+          fi
