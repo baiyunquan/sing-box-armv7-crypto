@@ -203,7 +203,9 @@ jobs:
               raise SystemExit(f"{path}: expected one FIPS-mode panic, found {bypassed_fips}")
 
           path.write_text("".join(kept))
-          print(f"{path}: dropped BoringSSL self-test call and bypassed the FIPS-mode check")
+          # Keep this line free of a leading "<path>: " so the Actions log parser does
+          # not turn it into an error annotation on an otherwise successful build.
+          print("BoringCrypto patch: dropped the BoringSSL self-test call and bypassed the FIPS-mode check")
           PY
           
           echo "Patching HMAC, RSA, and SHA-512 to fallback to Go stdlib pure Go..."
