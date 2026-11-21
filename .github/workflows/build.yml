@@ -157,36 +157,37 @@ jobs:
           
           echo "Compiling libcrypto.a..."
           ninja crypto
-
       - name: Guard Go's opaque BoringCrypto struct sizes
         run: |
           GOROOT=$(go env GOROOT)
-          cat > /tmp/sizes.c <<'C'
-          #include <stddef.h>
-          #include <openssl/aes.h>
-          #include <openssl/aead.h>
-          #include <openssl/bn.h>
-          #include <openssl/ecdsa.h>
-          #include <openssl/hmac.h>
-          #include <openssl/sha.h>
-          #include "goboringcrypto.h"
+          python3 - "${GOROOT}/src/crypto/internal/boring/goboringcrypto.h" > /tmp/sizes.c <<'PY'
+          import re
+          import sys
 
-          /* Go embeds these structs by value behind a char data[N] wrapper. A larger C
-             struct writes past the Go object and corrupts the Go heap, so assert the
-             32-bit layouts still fit what goboringcrypto.h promises. */
-          _Static_assert(sizeof(HMAC_CTX) <= sizeof(GO_HMAC_CTX), "HMAC_CTX outgrew GO_HMAC_CTX");
-          _Static_assert(sizeof(EVP_AEAD_CTX) <= sizeof(GO_EVP_AEAD_CTX), "EVP_AEAD_CTX outgrew GO_EVP_AEAD_CTX");
-          _Static_assert(sizeof(AES_KEY) <= sizeof(GO_AES_KEY), "AES_KEY outgrew GO_AES_KEY");
-          _Static_assert(sizeof(SHA_CTX) <= sizeof(GO_SHA_CTX), "SHA_CTX outgrew GO_SHA_CTX");
-          _Static_assert(sizeof(SHA256_CTX) <= sizeof(GO_SHA256_CTX), "SHA256_CTX outgrew GO_SHA256_CTX");
-          _Static_assert(sizeof(SHA512_CTX) <= sizeof(GO_SHA512_CTX), "SHA512_CTX outgrew GO_SHA512_CTX");
-          _Static_assert(sizeof(BIGNUM) <= sizeof(GO_BIGNUM), "BIGNUM outgrew GO_BIGNUM");
-          _Static_assert(sizeof(ECDSA_SIG) <= sizeof(GO_ECDSA_SIG), "ECDSA_SIG outgrew GO_ECDSA_SIG");
-          C
-          /usr/local/bin/arm-musl-cc -c /tmp/sizes.c \
-            -I"${GOROOT}/src/crypto/internal/boring" \
-            -Iboringssl-src/include \
-            -o /tmp/sizes.o
+          header = open(sys.argv[1]).read()
+          print("#include <stddef.h>")
+          for name in ("aead", "aes", "bn", "ecdsa", "hmac", "sha"):
+              print(f"#include <openssl/{name}.h>")
+          print()
+          print("/* Go embeds these structs by value behind a char data[N] wrapper in")
+          print("   goboringcrypto.h, so a larger C struct writes past the Go object and")
+          print("   corrupts the Go heap at runtime. Assert the 32-bit layouts still fit. */")
+          for match in re.finditer(
+              r"typedef struct (GO_[A-Z0-9_]+) \{ char data\[([0-9+]+)\]; \} \1;", header
+          ):
+              go_type, expr = match.group(1), match.group(2)
+              size = sum(int(part) for part in expr.split("+"))
+              if size <= 1:
+                  continue  # pointer-only wrappers hold no storage in Go
+              c_type = go_type[3:]
+              print(
+                  f'_Static_assert(sizeof({c_type}) <= {size}, '
+                  f'"{c_type} outgrew {go_type}");'
+              )
+          PY
+          sed -n '1,40p' /tmp/sizes.c
+          /usr/local/bin/arm-musl-cc -c /tmp/sizes.c -Iboringssl-src/include -o /tmp/sizes.o
+          echo "BoringCrypto opaque structs fit the Go wrappers (32-bit)."
           echo "BoringCrypto opaque structs fit the Go wrappers (32-bit)."
 
       - name: Generate and Install goboringcrypto_linux_arm.syso into Go SDK
