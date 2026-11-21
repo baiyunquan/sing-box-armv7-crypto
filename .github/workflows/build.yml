@@ -113,19 +113,39 @@ jobs:
             esac
             filtered+=("${arg}")
           done
-          exec /usr/local/zig/zig c++ -target arm-linux-musleabihf -mcpu=cortex_a53 "${filtered[@]}"
+          exec /usr/local/zig/zig c++ -target arm-linux-musleabihf -mcpu=cortex_a53 -DGOBORING "${filtered[@]}"
           WRAPPER
           sudo chmod +x /usr/local/bin/arm-musl-cc
 
-      - name: Build 32-bit ARM BoringSSL Static Library (musl)
+      - name: Build pinned BoringCrypto for ARM (musl)
         run: |
-          echo "Cloning official Google BoringSSL..."
-          git clone --depth 1 https://github.com/google/boringssl.git boringssl-src
+          # crypto/internal/boring/goboringcrypto.h embeds the C structs by value with
+          # hard-coded sizes taken from the FIPS BoringCrypto snapshot Go's official syso
+          # is built against (char data[104] for HMAC_CTX, char data[600] for
+          # EVP_AEAD_CTX, ...). Building current BoringSSL master makes those structs
+          # larger than the Go wrappers, so HMAC_CTX/EVP_AEAD_CTX initialisation writes
+          # past the Go object and the heap dies later, e.g. with
+          # "fatal error: runtime.SetFinalizer: finalizer already set" in a live run.
+          # Use exactly the snapshot Go 1.25.5 pins (crypto/internal/boring/Dockerfile).
+          BORINGSSL_REV=0c6f40132b828e92ba365c6b7680e32820c63fa7
+          echo "Downloading BoringCrypto ${BORINGSSL_REV} (the snapshot Go 1.25.5 pins)..."
+          curl -fsSL --retry 3 -o /tmp/boringssl.tar.xz \
+            "https://commondatastorage.googleapis.com/chromium-boringssl-fips/boringssl-${BORINGSSL_REV}.tar.xz"
+          rm -rf boringssl boringssl-src
+          tar -xJf /tmp/boringssl.tar.xz
+          mv "$(ls -d boringssl* | head -n 1)" boringssl-src
           cd boringssl-src
-          find . -name CMakeLists.txt -exec sed -i 's/-Werror//g' {} +
+
+          # Same source tweaks Go's own syso build applies (build-boring.sh): no weak
+          # malloc hooks under GOBORING and no LFS64 interfaces outside the module.
+          perl -p -i -e 's/defined.*ELF.*defined.*GNUC.*/$0 && !defined(GOBORING)/' crypto/mem.c
+          perl -p -i -e 's/(#define _FILE_OFFSET_BITS 64)/\/\/ $1/' crypto/bio/file.c
+          find . -name CMakeLists.txt -exec sed -i \
+            -e 's/-Werror//g' \
+            -e 's/cmake_minimum_required(VERSION [0-9.]*)/cmake_minimum_required(VERSION 3.22)/' {} +
+
           mkdir -p build && cd build
-          
-          echo "Configuring BoringSSL for 32-bit ARM Cortex-A53 (musl, ARMv8 crypto)..."
+          echo "Configuring BoringCrypto for 32-bit ARM Cortex-A53 (musl, ARMv8 crypto)..."
           cmake -GNinja \
             -DCMAKE_SYSTEM_NAME=Linux \
             -DCMAKE_SYSTEM_PROCESSOR=arm \
@@ -140,6 +160,37 @@ jobs:
           echo "Compiling libcrypto.a..."
           ninja crypto
 
+      - name: Guard Go's opaque BoringCrypto struct sizes
+        run: |
+          GOROOT=$(go env GOROOT)
+          cat > /tmp/sizes.c <<'C'
+          #include <stddef.h>
+          #include <openssl/aes.h>
+          #include <openssl/aead.h>
+          #include <openssl/bn.h>
+          #include <openssl/ecdsa.h>
+          #include <openssl/hmac.h>
+          #include <openssl/sha.h>
+          #include "goboringcrypto.h"
+
+          /* Go embeds these structs by value behind a char data[N] wrapper. A larger C
+             struct writes past the Go object and corrupts the Go heap, so assert the
+             32-bit layouts still fit what goboringcrypto.h promises. */
+          _Static_assert(sizeof(HMAC_CTX) <= sizeof(GO_HMAC_CTX), "HMAC_CTX outgrew GO_HMAC_CTX");
+          _Static_assert(sizeof(EVP_AEAD_CTX) <= sizeof(GO_EVP_AEAD_CTX), "EVP_AEAD_CTX outgrew GO_EVP_AEAD_CTX");
+          _Static_assert(sizeof(AES_KEY) <= sizeof(GO_AES_KEY), "AES_KEY outgrew GO_AES_KEY");
+          _Static_assert(sizeof(SHA_CTX) <= sizeof(GO_SHA_CTX), "SHA_CTX outgrew GO_SHA_CTX");
+          _Static_assert(sizeof(SHA256_CTX) <= sizeof(GO_SHA256_CTX), "SHA256_CTX outgrew GO_SHA256_CTX");
+          _Static_assert(sizeof(SHA512_CTX) <= sizeof(GO_SHA512_CTX), "SHA512_CTX outgrew GO_SHA512_CTX");
+          _Static_assert(sizeof(BIGNUM) <= sizeof(GO_BIGNUM), "BIGNUM outgrew GO_BIGNUM");
+          _Static_assert(sizeof(ECDSA_SIG) <= sizeof(GO_ECDSA_SIG), "ECDSA_SIG outgrew GO_ECDSA_SIG");
+          C
+          /usr/local/bin/arm-musl-cc -c /tmp/sizes.c \
+            -I"${GOROOT}/src/crypto/internal/boring" \
+            -Iboringssl-src/include \
+            -o /tmp/sizes.o
+          echo "BoringCrypto opaque structs fit the Go wrappers (32-bit)."
+
       - name: Generate and Install goboringcrypto_linux_arm.syso into Go SDK
         run: |
           GOROOT=$(go env GOROOT)
@@ -149,13 +200,12 @@ jobs:
           mkdir -p "${WORKDIR}" && cd "${WORKDIR}"
           
           echo "Extracting BoringCrypto symbol list from Go standard library..."
-          (grep -oE "_goboringcrypto_[A-Za-z0-9_]+" ${GOROOT}/src/crypto/internal/boring/goboringcrypto.h | sed 's/_goboringcrypto_//'; echo "BORINGSSL_bcm_power_on_self_test") | sort -u > syms.txt
+          grep -oE "_goboringcrypto_[A-Za-z0-9_]+" ${GOROOT}/src/crypto/internal/boring/goboringcrypto.h | sed 's/_goboringcrypto_//' | sort -u > syms.txt
           awk '{print "_goboringcrypto_" $0}' syms.txt > globals.txt
           awk '{print $0 " _goboringcrypto_" $0}' syms.txt > renames.txt
           
-          echo "Globalizing entrypoint and partial-linking libcrypto.a..."
-          arm-linux-gnueabihf-objcopy --globalize-symbol=BORINGSSL_bcm_power_on_self_test "${LIB_CRYPTO}" libcrypto_glob.a
-          arm-linux-gnueabihf-ld -r -nostdlib --whole-archive -o goboringcrypto.o libcrypto_glob.a
+          echo "Partial-linking libcrypto.a..."
+          arm-linux-gnueabihf-ld -r -nostdlib --whole-archive -o goboringcrypto.o "${LIB_CRYPTO}"
           arm-linux-gnueabihf-objcopy --remove-section=.llvm_addrsig goboringcrypto.o goboringcrypto1.o 2>/dev/null || cp goboringcrypto.o goboringcrypto1.o
           arm-linux-gnueabihf-objcopy --redefine-syms=renames.txt goboringcrypto1.o goboringcrypto2.o
           arm-linux-gnueabihf-objcopy --keep-global-symbols=globals.txt --strip-unneeded goboringcrypto2.o goboringcrypto_linux_arm.syso
@@ -167,50 +217,41 @@ jobs:
           echo "Enabling 32-bit ARM in Go crypto/internal/boring build constraints..."
           sudo sed -i 's/(amd64 || arm64)/(amd64 || arm64 || arm)/g' ${GOROOT}/src/crypto/internal/boring/*.go
 
-          # BoringSSL only defines BORINGSSL_bcm_power_on_self_test inside its FIPS build
-          # (crypto/fipsmodule/bcm.cc guards it with #if defined(BORINGSSL_FIPS) and marks
-          # it static), so a regular build exports no such symbol. Go's boring.go still
-          # calls it from init(), which breaks the external link with
-          # "undefined reference to `_goboringcrypto_BORINGSSL_bcm_power_on_self_test'".
-          # This is not a FIPS build, so drop the self-test call and bypass the FIPS-mode
-          # gate; there is no validated self-test to run against a locally built libcrypto.
+          # Go's boring.go calls the BoringSSL FIPS self-test and refuses to start unless
+          # FIPS_mode() reports 1. This is a regular (non-FIPS) build of the pinned
+          # snapshot, so neither the validated self-test nor FIPS mode is available:
+          # replace the whole init block with just the signature marker instead of
+          # referencing symbols this library does not export.
           sudo python3 - "${GOROOT}/src/crypto/internal/boring/boring.go" <<'PY'
           from pathlib import Path
           import sys
 
           path = Path(sys.argv[1])
-          lines = path.read_text().splitlines(keepends=True)
+          source = path.read_text()
 
-          self_test = "C._goboringcrypto_BORINGSSL_bcm_power_on_self_test()"
-          fips_panic = 'panic("boringcrypto: not in FIPS mode")'
+          old = (
+              "func init() {\n"
+              "\tC._goboringcrypto_BORINGSSL_bcm_power_on_self_test()\n"
+              "\tif C._goboringcrypto_FIPS_mode() != 1 {\n"
+              '\t\tpanic("boringcrypto: not in FIPS mode")\n'
+              "\t}\n"
+              "\tsig.BoringCrypto()\n"
+              "}\n"
+          )
+          new = "func init() {\n\tsig.BoringCrypto()\n}\n"
 
-          kept = []
-          removed_self_test = 0
-          bypassed_fips = 0
-          for line in lines:
-              if self_test in line:
-                  removed_self_test += 1
-                  continue
-              if fips_panic in line:
-                  bypassed_fips += 1
-                  kept.append(line.replace(fips_panic, "// bypass fips mode check"))
-                  continue
-              kept.append(line)
+          if source.count(old) != 1:
+              raise SystemExit("expected exactly one BoringCrypto init block in boring.go")
 
-          if removed_self_test != 1:
-              raise SystemExit(f"{path}: expected one BoringSSL self-test call, found {removed_self_test}")
-          if bypassed_fips != 1:
-              raise SystemExit(f"{path}: expected one FIPS-mode panic, found {bypassed_fips}")
-
-          path.write_text("".join(kept))
+          path.write_text(source.replace(old, new))
           # Keep this line free of a leading "<path>: " so the Actions log parser does
           # not turn it into an error annotation on an otherwise successful build.
-          print("BoringCrypto patch: dropped the BoringSSL self-test call and bypassed the FIPS-mode check")
+          print("BoringCrypto patch: dropped the FIPS self-test and FIPS-mode gate from boring.go init")
           PY
           
-          echo "Patching HMAC, RSA, and SHA-512 to fallback to Go stdlib pure Go..."
-          # HMAC fallback
-          sudo sed -i 's/return &hmac{/return nil \/\/ fallback pure Go\n\treturn \&hmac{/' ${GOROOT}/src/crypto/internal/boring/hmac.go
+          echo "Patching RSA and SHA-512 to fall back to the Go stdlib implementations..."
+          # crypto/internal/boring HMAC needs no patch: the pinned snapshot matches the
+          # struct sizes goboringcrypto.h promises, so BoringCrypto HMAC is safe here.
           # RSA fallback
           sudo python3 - "${GOROOT}/src/crypto/rsa" <<'PY'
           from pathlib import Path
