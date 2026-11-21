@@ -45,8 +45,47 @@ jobs:
           sudo rm -f /var/lib/dpkg/lock* /var/cache/apt/archives/lock /var/lib/apt/lists/lock 2>/dev/null || true
           sudo DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::Retries=3
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf cmake ninja-build perl qemu-user-static binutils-arm-linux-gnueabihf
-          which qemu-arm || sudo ln -sf $(which qemu-arm-static) /usr/local/bin/qemu-arm
+            gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf cmake ninja-build perl binutils-arm-linux-gnueabihf
+
+          # QEMU user-mode packaging is not stable across Ubuntu releases. On 26.04
+          # (current ubuntu-latest) `qemu-user-static` is only a virtual package with
+          # several providers, so apt refuses to pick one and exits 100, while the ARM
+          # emulator now ships in `qemu-user` as /usr/bin/qemu-arm. Probe for a package
+          # this runner can actually install instead of hard-coding a single name.
+          QEMU_PKG=""
+          for pkg in qemu-user qemu-user-static qemu-user-binfmt qemu-user-binfmt-hwe; do
+            if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --simulate "${pkg}" >/dev/null 2>&1; then
+              QEMU_PKG="${pkg}"
+              break
+            fi
+          done
+          if [ -z "${QEMU_PKG}" ]; then
+            echo "ERROR: no installable QEMU user-mode package on this runner"
+            apt-cache policy qemu-user qemu-user-static qemu-user-binfmt qemu-user-binfmt-hwe || true
+            exit 1
+          fi
+          echo "Installing QEMU user-mode package: ${QEMU_PKG}"
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${QEMU_PKG}"
+
+          # Locate the ARM emulator: modern releases install /usr/bin/qemu-arm, older
+          # ones only provided the static /usr/bin/qemu-arm-static.
+          QEMU_ARM="$(command -v qemu-arm || true)"
+          if [ -z "${QEMU_ARM}" ]; then
+            for candidate in /usr/bin/qemu-arm /usr/bin/qemu-arm-static /usr/local/bin/qemu-arm-static /usr/libexec/qemu-binfmt/arm-binfmt-P; do
+              if [ -x "${candidate}" ]; then
+                QEMU_ARM="${candidate}"
+                break
+              fi
+            done
+          fi
+          if [ -z "${QEMU_ARM}" ]; then
+            echo "ERROR: ARM user-mode emulator not found after installing ${QEMU_PKG}"
+            ls -l /usr/bin/qemu-* 2>/dev/null || true
+            exit 1
+          fi
+          echo "QEMU ARM emulator: ${QEMU_ARM}"
+          "${QEMU_ARM}" --version
+          echo "QEMU_ARM=${QEMU_ARM}" >> "${GITHUB_ENV}"
 
       - name: Build 32-bit ARM BoringSSL Static Library
         run: |
@@ -208,8 +247,9 @@ jobs:
       - name: Verify Execution with QEMU
         run: |
           cd dist
-          echo "Testing execution under QEMU ARMv8..."
-          qemu-arm -cpu max ./sing-box-linux-armv7-boringcrypto version || exit 1
+          QEMU_ARM="${QEMU_ARM:-qemu-arm}"
+          echo "Testing execution under ${QEMU_ARM} (-cpu max)..."
+          "${QEMU_ARM}" -cpu max ./sing-box-linux-armv7-boringcrypto version
           echo "sing-box executed successfully under QEMU!"
 
       - name: Package Artifacts
